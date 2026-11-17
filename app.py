@@ -609,10 +609,25 @@ async def set_token(request: Request):
     return {"ok": bool(result.get("works")), "token_saved": True, **result}
 
 
+LOG = []            # the most recent requests, so you can see exactly what the exam asked
+
+
+@app.get("/log")
+async def show_log(clear: int = 0):
+    """Every recent /query call: what was asked, what we replied, how long it took."""
+    out = {"count": len(LOG), "llm_model": LLM_STATE["model"], "llm_failures": LLM_STATE["failures"],
+           "llm_last_error": LLM_STATE["last_error"], "entries": list(LOG)}
+    if clear:
+        LOG.clear()
+    return out
+
+
 @app.post("/query")
 async def query(request: Request):
+    t0 = time.time()
+    raw = await request.body()
     try:
-        data = await request.json()
+        data = json.loads(raw)
     except Exception:
         data = {}
     if not isinstance(data, dict):
@@ -625,11 +640,19 @@ async def query(request: Request):
         top_k = 3
     top_k = max(1, min(top_k, 10))
     key = (question, top_k)
-    if key not in CACHE:
+    if key in CACHE:
+        resp, how = CACHE[key], "cache"
+    else:
         if len(CACHE) > 5000:
             CACHE.clear()
         resp = await answer_question(question, top_k)
+        how = "llm" if PROVIDERS else "rules"
         if resp.pop("_fallback", False):              # LLM was down: don't remember this answer
-            return JSONResponse(resp)
-        CACHE[key] = resp
-    return JSONResponse(CACHE[key])
+            how = "rules-fallback"
+        else:
+            CACHE[key] = resp
+    LOG.append({"n": len(LOG) + 1, "at": time.strftime("%H:%M:%S", time.gmtime(t0)),
+                "ms": int((time.time() - t0) * 1000), "how": how,
+                "body": raw.decode("utf-8", "replace")[:2000], "reply": resp})
+    del LOG[:-300]
+    return JSONResponse(resp)

@@ -527,6 +527,11 @@ CACHE: dict = {}
 
 @app.middleware("http")
 async def add_cors(request: Request, call_next):
+    path = re.sub(r"/{2,}", "/", request.scope["path"])  # forgive "//query", "//set-token"
+    if len(path) > 1:
+        path = path.rstrip("/")
+    request.scope["path"] = path
+    request.scope["raw_path"] = path.encode()
     if request.method == "OPTIONS":                      # browser "pre-flight" check
         return JSONResponse({}, headers=CORS)
     try:

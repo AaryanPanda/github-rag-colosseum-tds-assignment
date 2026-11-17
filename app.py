@@ -334,21 +334,51 @@ def rule_pipeline(question: str, top_k: int):
 
 
 # --------------------------------------------------------------------------
-# 5. LLM judge (switched on by putting your AI Pipe token in the AIPIPE_TOKEN env variable)
+# 5. LLM judge (switched on by the AIPIPE_TOKEN and/or OPENAI_API_KEY env variables)
 #    The LLM reads the top passages and decides: answer (and which passage) or abstain.
 #    Any failure (bad token, timeout, budget used up, made-up number) -> rule-based answer.
 # --------------------------------------------------------------------------
 import asyncio
 
+import time
+
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "").strip()
-OPENAI_API_KEY = AIPIPE_TOKEN or os.environ.get("OPENAI_API_KEY", "").strip()
-_default_base = "https://aipipe.org/openrouter/v1" if AIPIPE_TOKEN else "https://api.openai.com/v1"
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", _default_base).rstrip("/")
-_via_router = "openrouter" in OPENAI_BASE_URL
-_fallbacks = (["openai/gpt-4.1-mini", "openai/gpt-4o-mini", "openai/gpt-4.1-nano"] if _via_router
-              else ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1-nano"])
-MODELS = [m for m in dict.fromkeys([os.environ.get("OPENAI_MODEL", "").strip()] + _fallbacks) if m]
-LLM_STATE = {"model": None, "json_mode": True, "last_error": None, "calls": 0, "failures": 0}
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+_user_model = os.environ.get("OPENAI_MODEL", "").strip()
+_plain = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1-nano"]
+
+
+def _models(prefix):
+    return [m for m in dict.fromkeys([_user_model] + [prefix + m for m in _plain]) if m]
+
+
+# Every route we may use to reach an LLM, in order of preference. If one is out of credits
+# (HTTP 402), rejects the token (401), or is down, the next one is tried automatically.
+# The AI Pipe token can be replaced while the server is running (see /set-token below).
+PROVIDERS = []
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()      # optional password for /set-token
+TOKEN_INFO = {"set_at": None, "source": "env" if AIPIPE_TOKEN else None}
+
+
+def build_providers(aipipe_token: str):
+    PROVIDERS.clear()
+    if aipipe_token:
+        PROVIDERS.append({"name": "aipipe-openai", "url": "https://aipipe.org/openai/v1",
+                          "key": aipipe_token, "models": _models("")})
+        PROVIDERS.append({"name": "aipipe-openrouter", "url": "https://aipipe.org/openrouter/v1",
+                          "key": aipipe_token, "models": _models("openai/")})
+    if OPENAI_KEY:
+        PROVIDERS.append({"name": "openai", "key": OPENAI_KEY, "models": _models(""),
+                          "url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")})
+    for p in PROVIDERS:
+        p.update(model=None, json_mode=True, dead_until=0.0, error=None)
+
+
+build_providers(AIPIPE_TOKEN)
+LLM_STATE = {"model": None, "last_error": None, "calls": 0, "failures": 0}
+HOW_TO_TOKEN = ("Send your latest AI Pipe token to this server: open "
+                "/set-token?token=PASTE_TOKEN_HERE in the browser (or POST /set-token with JSON "
+                "{\"token\": \"...\"}). The reply tells you immediately whether the token works.")
 
 SYSTEM_PROMPT = """You are the answering step of a retrieval system. Use ONLY the numbered passages.
 
@@ -380,33 +410,52 @@ def _parse_json(text: str):
     return json.loads(m.group(0)) if m else {}
 
 
-async def _chat(messages):
-    """One chat call. Tries the models in MODELS until one works, then remembers it."""
+async def _chat_provider(p, messages):
+    """Ask one provider. Tries its models until one works, then remembers it."""
     global _client
     import httpx
 
     if _client is None:
         _client = httpx.AsyncClient(timeout=httpx.Timeout(4.5, connect=2.0))
-    models = [LLM_STATE["model"]] if LLM_STATE["model"] else MODELS
-    err = None
-    for model in models:
+    err, status = None, 0
+    for model in ([p["model"]] if p["model"] else p["models"]):
         for _ in range(2):
             body = {"model": model, "temperature": 0, "max_tokens": 220, "messages": messages}
-            if LLM_STATE["json_mode"]:
+            if p["json_mode"]:
                 body["response_format"] = {"type": "json_object"}
-            r = await _client.post(f"{OPENAI_BASE_URL}/chat/completions", json=body,
-                                   headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
-            if r.status_code == 200:
-                LLM_STATE["model"] = model
+            r = await _client.post(p["url"] + "/chat/completions", json=body,
+                                   headers={"Authorization": "Bearer " + p["key"]})
+            status = r.status_code
+            if status == 200:
+                p["model"], p["error"] = model, None
+                LLM_STATE["model"] = p["name"] + ":" + model
                 return r.json()["choices"][0]["message"]["content"]
-            err = f"HTTP {r.status_code} ({model}): {r.text[:200]}"
-            if r.status_code == 400 and LLM_STATE["json_mode"] and "response_format" in r.text:
-                LLM_STATE["json_mode"] = False       # this model has no JSON mode: retry plain
+            err = f"HTTP {status} ({model}): {r.text[:160]}"
+            if status == 400 and p["json_mode"] and "response_format" in r.text:
+                p["json_mode"] = False               # this model has no JSON mode: retry plain
                 continue
             break
-        if r.status_code in (401, 402, 403, 429) or r.status_code >= 500:
-            break                                    # token / budget / server problem: stop trying
+        if status in (401, 402, 403):                # token / credits problem: rest this route 10 min
+            p["dead_until"] = time.time() + 600
+            break
+        if status == 429 or status >= 500:           # busy: rest it briefly
+            p["dead_until"] = time.time() + 20
+            break
     raise RuntimeError(err or "no model worked")
+
+
+async def _chat(messages):
+    errors = []
+    for p in PROVIDERS:
+        if p["dead_until"] > time.time():
+            errors.append(f'{p["name"]}: resting after "{p["error"]}"')
+            continue
+        try:
+            return await _chat_provider(p, messages)
+        except Exception as e:
+            p["error"] = (str(e) or repr(e))[:220]
+            errors.append(f'{p["name"]}: {p["error"]}')
+    raise RuntimeError(" | ".join(errors) or "no LLM route configured")
 
 
 async def llm_answer(q: str, cand: list):
@@ -439,7 +488,7 @@ async def llm_answer(q: str, cand: list):
 async def answer_question(question: str, top_k: int):
     resp, ranked, scores, q = rule_pipeline(question, top_k)
     # clearly off-topic / empty questions never reach the LLM (cheaper, and injection-proof)
-    if not OPENAI_API_KEY or not ranked or scores[ranked[0]] < 0.2:
+    if not PROVIDERS or not ranked or scores[ranked[0]] < 0.2:
         return resp
     cand = ranked[:5]
     LLM_STATE["calls"] += 1
@@ -447,9 +496,9 @@ async def answer_question(question: str, top_k: int):
         answer, used = await asyncio.wait_for(llm_answer(q, cand), timeout=6.0)
     except Exception as e:
         LLM_STATE["failures"] += 1
-        LLM_STATE["last_error"] = (repr(e) or "timeout")[:300]
+        LLM_STATE["last_error"] = (str(e) or repr(e) or "timeout")[:400]
         print("LLM failed, using rule-based answer:", LLM_STATE["last_error"])
-        return resp
+        return dict(resp, _fallback=True)
     if answer is None:
         return abstain(conf=0.15)
     # the LLM acts as a re-ranker: passages it used go first
@@ -490,27 +539,69 @@ async def add_cors(request: Request, call_next):
     return response
 
 
+def _routes():
+    return [{"route": p["name"], "model": p["model"], "error": p["error"]} for p in PROVIDERS]
+
+
+async def _probe_llm():
+    """Make one tiny real LLM call and report which route worked (or why none did)."""
+    if not PROVIDERS:
+        return {"llm": False, "works": False, "needs_token": True, "next_step": HOW_TO_TOKEN}
+    for p in PROVIDERS:                               # forget old failures and test from scratch
+        p.update(dead_until=0.0, error=None)
+    try:
+        answer, used = await asyncio.wait_for(
+            llm_answer("How many nodes form a quorum in Raft consensus?", [0, 1, 24]), timeout=25.0)
+        return {"llm": True, "works": True, "using": LLM_STATE["model"], "sample_answer": answer,
+                "sample_passages": used, "routes": _routes()}
+    except Exception as e:
+        return {"llm": True, "works": False, "needs_token": True,
+                "problem": (str(e) or repr(e) or "timeout")[:600], "routes": _routes(),
+                "next_step": HOW_TO_TOKEN + " Until then questions get the rule-based answer."}
+
+
 @app.get("/")
 async def home():
-    return {"status": "ok", "passages": N, "dense": bool(EMBED), "llm": bool(OPENAI_API_KEY),
+    return {"status": "ok", "passages": N, "dense": bool(EMBED), "llm": bool(PROVIDERS),
+            "token_source": TOKEN_INFO["source"], "token_set_at": TOKEN_INFO["set_at"],
             "llm_model": LLM_STATE["model"], "llm_calls": LLM_STATE["calls"],
             "llm_failures": LLM_STATE["failures"], "llm_last_error": LLM_STATE["last_error"],
-            "usage": "POST /query {\"question\": \"...\", \"top_k\": 3}"}
+            "usage": "POST /query {\"question\": \"...\", \"top_k\": 3}",
+            "token": "GET /set-token?token=YOUR_AIPIPE_TOKEN  then  GET /llm-check"}
 
 
 @app.get("/llm-check")
 async def llm_check():
-    """Open this in a browser after deploying: tells you whether your token really works."""
-    if not OPENAI_API_KEY:
-        return {"llm": False, "problem": "No AIPIPE_TOKEN environment variable found. Rule-based mode."}
-    try:
-        answer, used = await asyncio.wait_for(
-            llm_answer("How many nodes form a quorum in Raft consensus?", [0, 1, 24]), timeout=7.0)
-        return {"llm": True, "works": True, "model": LLM_STATE["model"], "base_url": OPENAI_BASE_URL,
-                "sample_answer": answer, "sample_passages": used}
-    except Exception as e:
-        return {"llm": True, "works": False, "base_url": OPENAI_BASE_URL, "tried_models": MODELS,
-                "problem": (repr(e) or "timeout")[:400]}
+    """Tells you whether the current token works. If not, it asks you for a fresh one."""
+    return await _probe_llm()
+
+
+@app.api_route("/set-token", methods=["GET", "POST"])
+async def set_token(request: Request):
+    """Give the server your latest AI Pipe token (kept in memory only, never shown back)."""
+    data = dict(request.query_params)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                data.update({k: str(v) for k, v in body.items()})
+        except Exception:
+            pass
+    if ADMIN_KEY and data.get("key", "") != ADMIN_KEY:
+        return JSONResponse({"ok": False, "problem": "Wrong or missing key (add &key=YOUR_ADMIN_KEY)."},
+                            status_code=403)
+    token = (data.get("token") or "").strip().strip('"')
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if len(token) < 20:
+        return JSONResponse({"ok": False, "problem": "No token received.", "next_step": HOW_TO_TOKEN},
+                            status_code=400)
+    build_providers(token)
+    TOKEN_INFO.update(set_at=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), source="set-token")
+    CACHE.clear()                                     # old answers may have been fallbacks
+    LLM_STATE.update(model=None, last_error=None)
+    result = await _probe_llm()
+    return {"ok": bool(result.get("works")), "token_saved": True, **result}
 
 
 @app.post("/query")
@@ -532,5 +623,8 @@ async def query(request: Request):
     if key not in CACHE:
         if len(CACHE) > 5000:
             CACHE.clear()
-        CACHE[key] = await answer_question(question, top_k)
+        resp = await answer_question(question, top_k)
+        if resp.pop("_fallback", False):              # LLM was down: don't remember this answer
+            return JSONResponse(resp)
+        CACHE[key] = resp
     return JSONResponse(CACHE[key])
